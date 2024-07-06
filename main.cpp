@@ -1,5 +1,6 @@
 #include <boost/filesystem.hpp>
 #include <gst/gst.h>
+#include <gst/app/gstappsink.h>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -34,7 +35,7 @@ struct VideoOutput {
    */
   bool parseFromJsonString(const std::string &str, std::string *err = nullptr);
   /**\param json_pointer path to video output element. Use '/' as separator,
-   * like /outputs/0 - first element in outputs array
+   * like `/outputs/0` - first element in outputs array
    */
   bool parseFromJsonString(const std::string &str,
                            const std::string &json_pointer,
@@ -48,6 +49,7 @@ public:
 private:
   bool init_(const std::list<boost::filesystem::path> &records, const VideoOutput &output, std::string *err);
   static void on_pad_added(GstElement *element, GstPad *pad, gpointer data);
+  static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer data);
 
   /**\return 1 if pipeline was succesfully added, -1 in case of error, 0 if
    * record was rejected without errors
@@ -61,8 +63,7 @@ private:
             int *fps_denominator,
             std::string *err);
 
-  struct Pipeline
-  {
+  struct Pipeline {
     GstElement *pipeline = nullptr;
     GstElement *sink = nullptr;
 
@@ -157,7 +158,6 @@ bool VideoSrc::caps(std::string *format,
   TRY_SET(fps_numerator, n);
   TRY_SET(fps_denominator, d);
 
-
   gst_caps_unref(caps);
   gst_object_unref(GST_OBJECT(pad));
 
@@ -179,15 +179,11 @@ bool VideoSrc::init(const boost::filesystem::path &record, const std::string &ou
     VideoOutput output;
     output.name = output_name;
 
-    // std::string output = output_name;
-
-    // Simplified pipeline creation
     std::stringstream pipeline_ss;
     pipeline_ss << "filesrc location=" << records.back().string() << " ! "
                 << "matroskademux name=demuxer ! "
-                // << "vp9dec name=next ! "
-                << "h264parse ! avdec_h264 name=next ! "
-                << "appsink name=sink max-buffers=1 sync=FALSE";
+                << "h264parse name=h264parse ! avdec_h264 name=decoder ! "
+                << "videoconvert ! video/x-raw,format=I420 ! appsink name=sink max-buffers=1 sync=FALSE emit-signals=true";
 
     std::string pipeline_str = pipeline_ss.str();
 
@@ -206,31 +202,38 @@ bool VideoSrc::init(const boost::filesystem::path &record, const std::string &ou
     int numerator;
     int denominator;
     GstElement *demuxer = gst_bin_get_by_name(GST_BIN(pipeline), "demuxer");
-    GstElement *next = gst_bin_get_by_name(GST_BIN(pipeline), "next");
-    GstElement *sink = nullptr;
+    GstElement *h264parse = gst_bin_get_by_name(GST_BIN(pipeline), "h264parse");
+    GstElement *decoder = gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
+    GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+    if (!demuxer || !h264parse || !decoder || !sink) {
+        if (err) *err = "Failed to get elements from pipeline";
+        gst_object_unref(pipeline);
+        return false;
+    }
 
-    g_signal_connect(demuxer, "pad-added", G_CALLBACK(on_pad_added), next);
+    g_signal_connect(demuxer, "pad-added", G_CALLBACK(on_pad_added), h264parse);
+    g_signal_connect(sink, "new-sample", G_CALLBACK(on_new_sample), nullptr);
 
     gst_element_set_state(pipeline, GST_STATE_PAUSED);
     GstStateChangeReturn ret = gst_element_get_state(pipeline, nullptr, nullptr, GST_CLOCK_TIME_NONE);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         if (err) *err = "cannot run last record to get current caps";
         gst_object_unref(demuxer);
-        gst_object_unref(next);
+        gst_object_unref(h264parse);
+        gst_object_unref(decoder);
+        gst_object_unref(sink);
         gst_element_set_state(pipeline, GST_STATE_NULL);
         gst_object_unref(pipeline);
         return false;
     }
 
     // get caps
-    sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
-
-    p.sink   = sink;
+    p.sink = sink;
     current_ = &p;
 
     if (this->caps(&format, &width, &height, &numerator, &denominator, err) == false) {
       goto Failure;
-    };
+    }
     // fill VideoOutput structure and use default initializer
     output.capabilities.type = "video/x-raw";
     output.capabilities.format = format;
@@ -239,15 +242,8 @@ bool VideoSrc::init(const boost::filesystem::path &record, const std::string &ou
     output.capabilities.fps.numerator = numerator;
     output.capabilities.fps.denominator = denominator;
 
-    // pipelines_.push_back({pipeline, gst_bin_get_by_name(GST_BIN(pipeline), "sink")});
-    // current_ = &pipelines_.back();
-
-
-    gst_object_unref(GST_OBJECT(demuxer));
-    gst_object_unref(GST_OBJECT(next));
-    gst_object_unref(GST_OBJECT(sink));
     gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(GST_OBJECT(pipeline));
+    gst_object_unref(pipeline);
 
     current_ = nullptr;
 
@@ -256,17 +252,20 @@ bool VideoSrc::init(const boost::filesystem::path &record, const std::string &ou
 Failure:
   current_ = nullptr;
   if (demuxer) {
-    gst_object_unref(GST_OBJECT(demuxer));
+    gst_object_unref(demuxer);
   }
-  if (next) {
-    gst_object_unref(GST_OBJECT(next));
+  if (h264parse) {
+    gst_object_unref(h264parse);
+  }
+  if (decoder) {
+    gst_object_unref(decoder);
   }
   if (sink) {
-    gst_object_unref(GST_OBJECT(sink));
+    gst_object_unref(sink);
   }
   if (pipeline) {
     gst_element_set_state(pipeline, GST_STATE_NULL);
-    gst_object_unref(GST_OBJECT(pipeline));
+    gst_object_unref(pipeline);
   }
   return false;
 }
@@ -340,7 +339,6 @@ int VideoSrc::addRecord(const boost::filesystem::path &filepath,
   return 1;
 }
 
-
 int VideoSrc::makePipeline(const boost::filesystem::path &filepath,
                            Pipeline                      *retval,
                            std::string                   *err) {
@@ -348,43 +346,12 @@ int VideoSrc::makePipeline(const boost::filesystem::path &filepath,
   std::chrono::nanoseconds end_ts;
   gint64                   duration_ns = 0;
 
-//   if (match(filepath, output_.name, &begin_ts) == false) {
-//     // should never happen at that point
-//     return -1;
-//   }
-
   std::stringstream pipeline_ss;
-  // clang-format off
   pipeline_ss << "filesrc location=" << filepath.string() << " ! "
               << "matroskademux name=demuxer ! "
-              // XXX here is dynamic linking and we should link them manually,
-              // because pipelines from parse-launch are not reusable if there
-              // is a dynamic linking:
-              // https://gstreamer.freedesktop.org/documentation/gstreamer/gstparse.html?gi-language=c#gst_parse_launch
-#ifdef USE_HW_PIPELINE
-              << "h264parse ! "
-              << "nvv4l2decoder name=next ! "
-#else
-              // << "vp9dec name=next ! "
-              << "h264parse ! avdec_h264 name=next ! "
-#endif
-              << "videoconvert ! "
-              // XXX don't use videorate here, process every frame
-              //<< "videorate drop-only=TRUE ! "
-#ifdef USE_HW_PIPELINE
-              << "nvvidconv interpolation-method=5 ! "
-              << "video/x-raw,format=" << intermediateHWFormat(output_.capabilities.format) << " ! "
-#else
-              << "videoscale method=5 ! "
-#endif
-              << "videoconvert ! "
-              << output_.capabilities.type << ','
-              << "format=" << output_.capabilities.format << ','
-              << "width=" << output_.capabilities.width << ','
-              << "height=" << output_.capabilities.height << " ! "
-              << "able_ts start-timestamp=" << begin_ts.count() * GST_NSECOND  << " ! "
-              << "appsink name=sink max-buffers=5 sync=FALSE";
-  // clang-format on
+              << "h264parse name=h264parse ! avdec_h264 name=decoder ! "
+              << "videoconvert ! video/x-raw,format=I420 ! "
+              << "appsink name=sink max-buffers=5 sync=false emit-signals=true";
 
   std::string pipeline_str = pipeline_ss.str();
 
@@ -408,30 +375,45 @@ int VideoSrc::makePipeline(const boost::filesystem::path &filepath,
     return -1;
   }
 
-  GstElement *next = gst_bin_get_by_name(GST_BIN(pipeline), "next");
-  if (next == nullptr) {
-    TRY_SET(err, "can not get 'next' element from input pipeline");
+  GstElement *h264parse = gst_bin_get_by_name(GST_BIN(pipeline), "h264parse");
+  if (h264parse == nullptr) {
+    TRY_SET(err, "can not get 'h264parse' from input pipeline");
 
     gst_object_unref(GST_OBJECT(pipeline));
     gst_object_unref(GST_OBJECT(demuxer));
     return -1;
   }
 
-  g_signal_connect(demuxer, "pad-added", G_CALLBACK(on_pad_added), next);
+  GstElement *decoder = gst_bin_get_by_name(GST_BIN(pipeline), "decoder");
+  if (decoder == nullptr) {
+    TRY_SET(err, "can not get 'decoder' element from input pipeline");
 
-  gst_object_unref(GST_OBJECT(demuxer));
-  gst_object_unref(GST_OBJECT(next));
+    gst_object_unref(GST_OBJECT(pipeline));
+    gst_object_unref(GST_OBJECT(demuxer));
+    gst_object_unref(GST_OBJECT(h264parse));
+    return -1;
+  }
 
   GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
   if (sink == nullptr) {
     TRY_SET(err, "can not get 'sink' element from input pipeline");
 
     gst_object_unref(GST_OBJECT(pipeline));
+    gst_object_unref(GST_OBJECT(demuxer));
+    gst_object_unref(GST_OBJECT(h264parse));
+    gst_object_unref(GST_OBJECT(decoder));
     return -1;
   }
 
+  g_signal_connect(demuxer, "pad-added", G_CALLBACK(on_pad_added), h264parse);
+  g_signal_connect(sink, "new-sample", G_CALLBACK(on_new_sample), nullptr);
+
+  gst_object_unref(GST_OBJECT(demuxer));
+  gst_object_unref(GST_OBJECT(h264parse));
+  gst_object_unref(GST_OBJECT(decoder));
+  gst_object_unref(GST_OBJECT(sink));
+
   GstBus *bus = gst_element_get_bus(pipeline);
-  // gst_element_link_pads(sink, "sink", next, "sink");
 
   // check that pipeline can be run
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -453,13 +435,10 @@ int VideoSrc::makePipeline(const boost::filesystem::path &filepath,
     goto InvalidRecord;
   }
 
-  // XXX stop the pipeline. It is not a good idea to keep a bunch of gst
-  // pipelines running, because they can consume a lot of memory. Instead
-  // run them when it is needed
+  // stop the pipeline
   gst_element_set_state(pipeline, GST_STATE_NULL);
 
   retval->pipeline      = pipeline;
-//   retval->bus           = bus;
   retval->sink          = sink;
   retval->data_filepath = filepath;
   retval->begin_ts      = begin_ts;
@@ -467,8 +446,7 @@ int VideoSrc::makePipeline(const boost::filesystem::path &filepath,
 
   return 1;
 
-InvalidRecord: // XXX if something go wrong, then we should remove the pipeline
-               // properly
+InvalidRecord:
   gst_element_set_state(pipeline, GST_STATE_NULL);
   gst_object_unref(GST_OBJECT(sink));
   gst_object_unref(GST_OBJECT(bus));
@@ -477,12 +455,33 @@ InvalidRecord: // XXX if something go wrong, then we should remove the pipeline
   return 0;
 }
 
-
 void VideoSrc::on_pad_added(GstElement *element, GstPad *pad, gpointer data) {
-    GstElement *next = static_cast<GstElement *>(data);
-    GstPad *sinkpad = gst_element_get_static_pad(next, "sink");
-    gst_pad_link(pad, sinkpad);
-    gst_object_unref(sinkpad);
+    GstElement *h264parse = static_cast<GstElement *>(data);
+    GstPad *sinkpad = gst_element_get_static_pad(h264parse, "sink");
+    if (gst_pad_is_linked(sinkpad)) {
+        g_object_unref(sinkpad);
+        return;
+    }
+    GstPadLinkReturn ret = gst_pad_link(pad, sinkpad);
+    if (ret != GST_PAD_LINK_OK) {
+        g_printerr("Failed to link demuxer to h264parse: %d\n", ret);
+    }
+    g_object_unref(sinkpad);
+}
+
+GstFlowReturn VideoSrc::on_new_sample(GstAppSink *appsink, gpointer data) {
+    GstSample *sample = gst_app_sink_pull_sample(appsink);
+    if (sample) {
+        GstCaps *caps = gst_sample_get_caps(sample);
+        GstBuffer *buffer = gst_sample_get_buffer(sample);
+        if (caps && buffer) {
+            g_print("Received new sample with caps: %s\n", gst_caps_to_string(caps));
+            g_print("Buffer size: %zu\n", gst_buffer_get_size(buffer));
+        }
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+    return GST_FLOW_ERROR;
 }
 
 int main(int argc, char *argv[]) {
