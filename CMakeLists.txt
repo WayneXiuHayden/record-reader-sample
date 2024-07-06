@@ -12,6 +12,7 @@ endif()
 # Define build type options
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_CXX_STANDARD 17)
 
 add_executable(minimal_example main.cpp)
 
