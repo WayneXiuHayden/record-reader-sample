@@ -182,7 +182,8 @@ bool VideoSrc::init(const boost::filesystem::path &record, const std::string &ou
     std::stringstream pipeline_ss;
     pipeline_ss << "filesrc location=" << records.back().string() << " ! "
                 << "matroskademux name=demuxer ! "
-                << "h264parse name=h264parse ! avdec_h264 name=decoder ! "
+                << "h264parse name=h264parse ! "
+                << "avdec_h264 name=decoder ! "
                 << "videoconvert ! video/x-raw,format=I420 ! appsink name=sink max-buffers=1 sync=FALSE emit-signals=true";
 
     std::string pipeline_str = pipeline_ss.str();
@@ -347,11 +348,29 @@ int VideoSrc::makePipeline(const boost::filesystem::path &filepath,
   gint64                   duration_ns = 0;
 
   std::stringstream pipeline_ss;
+  // clang-format off
   pipeline_ss << "filesrc location=" << filepath.string() << " ! "
               << "matroskademux name=demuxer ! "
-              << "h264parse name=h264parse ! avdec_h264 name=decoder ! "
-              << "videoconvert ! video/x-raw,format=I420 ! "
-              << "appsink name=sink max-buffers=5 sync=false emit-signals=true";
+              // XXX here is dynamic linking and we should link them manually,
+              // because pipelines from parse-launch are not reusable if there
+              // is a dynamic linking:
+              // https://gstreamer.freedesktop.org/documentation/gstreamer/gstparse.html?gi-language=c#gst_parse_launch
+  #ifdef USE_HW_PIPELINE
+                << "h264parse ! "
+                << "nvv4l2decoder name=next ! "
+  #else              
+              << "h264parse name=h264parse ! "
+              << "avdec_h264 name=decoder ! "
+  #endif
+              << "videoconvert ! "
+              << output_.capabilities.type << ','
+              << "format=" << output_.capabilities.format << ','
+              << "width=" << output_.capabilities.width << ','
+              << "height=" << output_.capabilities.height << " ! "
+              << "able_ts start-timestamp=" << begin_ts.count() * GST_NSECOND  << " ! "
+              << "appsink name=sink max-buffers=5 sync=FALSE emit-signals=true";
+              // << "videoconvert ! video/x-raw,format=I420 ! "
+              // << "appsink name=sink max-buffers=5 sync=false emit-signals=true";
 
   std::string pipeline_str = pipeline_ss.str();
 
